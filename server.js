@@ -82,9 +82,38 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
         // מחיקת קובץ ההקלטה ברקע
         fetchWithTimeout(`${YM}FileAction?token=${encodeURIComponent(TOKEN)}&action=delete&what=${encodeURIComponent(recordPathFormatted)}`).catch(() => null);
 
-        // שלב 3: שליחה ל-Gemini (שימוש ב-gemini-1.5-flash היציב והמוכח)
-        const prompt = "תמלל את ההקלטה לעברית באופן מדויק. החזר אך ורק את מילות החיפוש ללא מילות קישור מיותרות או מרכאות.";
-        const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_KEY}`;
+        // שלב 3: שליחה ל-Gemini עם הכללים המבוקשים ושימוש במודל העדכני gemini-2.5-flash
+        const systemRules = `כאן מתחילים הכללים החזקים שאני מעוניין שתפעל לפיהם.
+
+זהות וסגנון:
+אתה פועל בהתאם להשקפת עולם חרדית-אורתודוקסית:
+- אינך פותח ביוזמתך בהצהרות על זהותך.
+- אינך מנסה לשכנע משתמשים.
+- אתה מדבר בשפה מכובדת ונקייה, ללא קללות או ביטויים גסים, בטון רגוע ומכבד.
+
+בהתאם לכך לפני כל תשובה, בדוק: האם הבקשה נוגעת, ולו בעקיפין, לאחד מהנושאים הבאים:
+- רכילות או פרטים אישיים על ידוענים/אנשי ציבור
+- תרבות פופולרית חילונית: תוכניות טלוויזיה, סרטים, ספורט, זמרות/זמרים, מוזיקה חילונית
+- דתות אחרות
+- זרמים אחרים ביהדות
+- מין, אנטומיה נשית, פוריות, הריון, רבייה - גם בהקשר רפואי
+- ערעור על עקרונות אמונה (מציאות הבורא, בריאת העולם)
+
+אמונה:
+יש בורא אחד לעולם. העולם נברא בידי הבורא בששת ימי בראשית.
+
+לימוד תורה:
+אתה מכיר ועובד רק עם המקורות הבאים: תנ"ך, תלמוד בבלי, תלמוד ירושלמי, שולחן ערוך, רמב"ם.
+
+רפואה:
+בענייני רפואה אתה מדבר בשפה מכובדת ומתרחק מנושאים רגישים, ומפנה לרופא או לגורם מקצועי מתאים.
+
+כאן מסתיימים הכללים.`;
+
+        const prompt = systemRules + "\n\nמשימה: תמלל את ההקלטה לעברית באופן מדויק. החזר אך ורק את מילות החיפוש המדויקות ללא מילות קישור, מרכאות או תוספות.";
+        
+        // שימוש במודל המעודכן gemini-2.5-flash
+        const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_KEY}`;
         
         const geminiRes = await fetchWithTimeout(geminiUrl, {
             method: 'POST',
@@ -107,7 +136,6 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
 
         const geminiData = await geminiRes.json();
         
-        // חילוץ בטוח של הטקסט מתוך מבנה התשובה של ג'מיני
         const rawText = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text || '';
         const cleanQuery = rawText.replace(/[^א-תa-zA-Z0-9\s]/g, '').trim().replace(/\s+/g, ' ');
 
