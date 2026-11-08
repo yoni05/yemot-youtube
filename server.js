@@ -2,9 +2,6 @@ const express = require('express');
 const ytDlp = require('yt-dlp-exec');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegPath = require('ffmpeg-static');
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
 
 ffmpeg.setFfmpegPath(ffmpegPath);
 
@@ -20,14 +17,18 @@ const YM = 'https://www.call2all.co.il/ym/api/';
 async function fetchWithTimeout(url, options = {}, timeout = 25000) {
     const controller = new AbortController();
     const id = setTimeout(() => controller.abort(), timeout);
-    const response = await fetch(url, { ...options, signal: controller.signal });
-    clearTimeout(id);
-    return response;
+    try {
+        const response = await fetch(url, { ...options, signal: controller.signal });
+        clearTimeout(id);
+        return response;
+    } catch (err) {
+        clearTimeout(id);
+        throw err;
+    }
 }
 
 app.get('/', (req, res) => { res.send('YouTube Line Server OK - Ready'); });
 
-// נתיב השמעה ישיר ב-MP3 במידה ומשתמשים בהזרמה ישירה
 app.get('/stream/:videoId.mp3', (req, res) => {
     const videoId = req.params.videoId;
     if (!videoId) return res.status(400).end();
@@ -81,9 +82,9 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
         // מחיקת קובץ ההקלטה ברקע
         fetchWithTimeout(`${YM}FileAction?token=${encodeURIComponent(TOKEN)}&action=delete&what=${encodeURIComponent(recordPathFormatted)}`).catch(() => null);
 
-        // שלב 3: שליחה ל-Gemini לזיהוי דיבור (שימוש במודל עדכני ותקני)
-        const prompt = "תמלל את ההקלטה לעברית. החזר אך ורק את מילות החיפוש המדויקות ללא מילות קישור, מרכאות או תוספות.";
-        const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_KEY}`;
+        // שלב 3: שליחה ל-Gemini (שימוש ב-gemini-1.5-flash היציב והמוכח)
+        const prompt = "תמלל את ההקלטה לעברית באופן מדויק. החזר אך ורק את מילות החיפוש ללא מילות קישור מיותרות או מרכאות.";
+        const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_KEY}`;
         
         const geminiRes = await fetchWithTimeout(geminiUrl, {
             method: 'POST',
@@ -98,8 +99,16 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
             })
         });
 
+        if (!geminiRes.ok) {
+            const errText = await geminiRes.text();
+            console.error('Gemini API Error:', errText);
+            throw new Error('Gemini API failed');
+        }
+
         const geminiData = await geminiRes.json();
-        const rawText = (((geminiData.candidates || [])[0] || {}).content || {}).parts?.[0]?.text || '';
+        
+        // חילוץ בטוח של הטקסט מתוך מבנה התשובה של ג'מיני
+        const rawText = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text || '';
         const cleanQuery = rawText.replace(/[^א-תa-zA-Z0-9\s]/g, '').trim().replace(/\s+/g, ' ');
 
         if (!cleanQuery) {
@@ -112,20 +121,20 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
         const ytData = await ytRes.json();
 
         if (!ytData.items || ytData.items.length === 0) {
-            return res.send(`id_list_message=t-לא נמצאו תוצאות עבור ${cleanQuery}&go_to_folder=/`);
+            return res.send(`id_list_message=t-לא נמצאו תוצאות עבור החיפוש&go_to_folder=/`);
         }
 
         const videoId = ytData.items[0].id.videoId;
         const title = (ytData.items[0].snippet.title || '').replace(/[^א-תa-zA-Z0-9\s]/g, ' ');
 
-        // שלב 5: השמעה בימות המשיח באמצעות פקודת id_list_message התקנית לקישור חיצוני
+        // שלב 5: השמעה בימות המשיח
         const hostUrl = `https://${req.get('host')}`;
         const streamUrl = `${hostUrl}/stream/${videoId}.mp3`;
 
-        return res.send(`id_list_message=t-משמיע ${title}.f-${streamUrl}&go_to_folder=/`);
+        return res.send(`id_list_message=t-משמיע את התוצאה.f-${streamUrl}&go_to_folder=/`);
 
     } catch (e) {
-        console.error('Error:', e.message);
+        console.error('Server Error:', e.message);
         if (!res.headersSent) {
             return res.send('id_list_message=t-אירעה תקלה בעיבוד הבקשה&go_to_folder=/');
         }
