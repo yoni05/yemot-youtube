@@ -2,19 +2,22 @@ const express = require('express');
 const ytDlp = require('yt-dlp-exec');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegPath = require('ffmpeg-static');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
 
-// הגדרת נתיב מנוע ההמרה
 ffmpeg.setFfmpegPath(ffmpegPath);
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
 
 const TOKEN = process.env.YEMOT_TOKEN || '';
 const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
 const YT_KEY = process.env.YOUTUBE_API_KEY || '';
 const YM = 'https://www.call2all.co.il/ym/api/';
 
-async function fetchWithTimeout(url, options = {}, timeout = 15000) {
+async function fetchWithTimeout(url, options = {}, timeout = 25000) {
     const controller = new AbortController();
     const id = setTimeout(() => controller.abort(), timeout);
     const response = await fetch(url, { ...options, signal: controller.signal });
@@ -22,65 +25,66 @@ async function fetchWithTimeout(url, options = {}, timeout = 15000) {
     return response;
 }
 
-app.get('/', (req, res) => { res.send('YouTube Line Server OK (Optimized MP3 Proxy)'); });
+app.get('/', (req, res) => { res.send('YouTube Line Server OK - Ready'); });
 
-// נתיב נקי להזרמה (Proxy) והמרה ל-MP3 באופטימיזציה לטלפון
-app.get('/stream/:videoId.mp3', async (req, res) => {
+// נתיב השמעה ישיר ב-MP3 במידה ומשתמשים בהזרמה ישירה
+app.get('/stream/:videoId.mp3', (req, res) => {
     const videoId = req.params.videoId;
-    if (!videoId) return res.status(400).send('Missing video ID');
+    if (!videoId) return res.status(400).end();
 
-    try {
-        // שליחת כותרות מידיות למניעת ניתוק מצד ימות המשיח
-        res.setHeader('Content-Type', 'audio/mpeg');
-        res.setHeader('Transfer-Encoding', 'chunked');
+    res.setHeader('Content-Type', 'audio/mpeg');
+    
+    const subprocess = ytDlp.exec(`https://www.youtube.com/watch?v=${videoId}`, {
+        output: '-',
+        format: 'bestaudio/best',
+        noWarnings: true,
+        noCheckCertificates: true,
+        extractorArgs: 'youtube:player_client=android,web'
+    }, { stdio: ['ignore', 'pipe', 'ignore'] });
 
-        const info = await ytDlp(`https://www.youtube.com/watch?v=${videoId}`, {
-            dumpJson: true,
-            format: 'bestaudio[ext=m4a]/bestaudio/best',
-            noWarnings: true,
-            noCheckCertificates: true
-        });
+    ffmpeg(subprocess.stdout)
+        .format('mp3')
+        .audioCodec('libmp3lame')
+        .audioChannels(1)
+        .audioFrequency(16000)
+        .audioBitrate('32k')
+        .on('error', (err) => {
+            console.error('Stream error:', err.message);
+            if (!res.headersSent) res.status(500).end();
+        })
+        .pipe(res, { end: true });
 
-        if (!info || !info.url) throw new Error('No audio URL found');
-        
-        ffmpeg(info.url)
-            .format('mp3')
-            .audioCodec('libmp3lame')
-            .audioChannels(1) // מונו לשיפור מהירות וחיסכון ברוחב פס
-            .audioBitrate('32k') // דחיסה מותאמת לאיכות טלפון
-            .on('error', (err) => {
-                console.error('FFmpeg stream error:', err.message);
-            })
-            .pipe(res, { end: true });
-
-    } catch (e) {
-        console.error('Streaming error:', e.message);
-        if (!res.headersSent) res.status(500).end();
-    }
+    req.on('close', () => {
+        try { subprocess.kill(); } catch (e) {}
+    });
 });
 
 app.all(['/yemot', '/yemot/:e'], async (req, res) => {
     const q = { ...req.query, ...req.body };
-    res.type('text/plain');
+    res.type('text/plain; charset=utf-8');
 
     try {
-        if (q.hangup === 'yes') return res.send('noop=bye');
+        if (q.hangup === 'yes') return res.send('noop');
 
+        // שלב 1: בקשת הקלטה בתחביר התקני של ימות המשיח
         if (!q.RecordPath) {
-            const fileName = 'query_' + Date.now();
-            return res.send(`read=t-אנא אמרו את שם השיעור לאחר הצפצוף&record=yes&record_filename=${fileName}`);
+            return res.send('read=t-אנא אמרו את שם השיעור המבוקש ובסיום הקישו סולמית=RecordPath,no,record,,no,7,2');
         }
 
-        const downloadUrl = `${YM}DownloadFile?token=${encodeURIComponent(TOKEN)}&path=${encodeURIComponent(q.RecordPath)}`;
+        // שלב 2: הורדת ההקלטה מימות המשיח
+        const recordPathFormatted = q.RecordPath.startsWith('ivr2:') ? q.RecordPath : `ivr2:${q.RecordPath}`;
+        const downloadUrl = `${YM}DownloadFile?token=${encodeURIComponent(TOKEN)}&path=${encodeURIComponent(recordPathFormatted)}`;
         const audioRes = await fetchWithTimeout(downloadUrl);
-        if (!audioRes.ok) throw new Error('שגיאה בהורדת הקובץ מימות המשיח');
+        if (!audioRes.ok) throw new Error('Failed to download recording from Yemot');
         const audioBuf = Buffer.from(await audioRes.arrayBuffer());
 
-        fetchWithTimeout(`${YM}FileAction?token=${encodeURIComponent(TOKEN)}&action=delete&what=${encodeURIComponent(q.RecordPath)}`).catch(() => null);
+        // מחיקת קובץ ההקלטה ברקע
+        fetchWithTimeout(`${YM}FileAction?token=${encodeURIComponent(TOKEN)}&action=delete&what=${encodeURIComponent(recordPathFormatted)}`).catch(() => null);
 
+        // שלב 3: שליחה ל-Gemini לזיהוי דיבור (שימוש במודל עדכני ותקני)
         const prompt = "תמלל את ההקלטה לעברית. החזר אך ורק את מילות החיפוש המדויקות ללא מילות קישור, מרכאות או תוספות.";
+        const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_KEY}`;
         
-        const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_KEY}`;
         const geminiRes = await fetchWithTimeout(geminiUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -92,41 +96,41 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
                     ]
                 }]
             })
-        }, 20000);
+        });
 
         const geminiData = await geminiRes.json();
-        const queryRawText = (((geminiData.candidates || [])[0] || {}).content || {}).parts[0].text || '';
-        
-        // סינון קפדני: השארת אותיות, מספרים ורווחים בלבד, למניעת קריסות בחיפוש
-        const cleanQuery = queryRawText.replace(/[^א-תa-zA-Z0-9\s]/g, '').trim().replace(/\s+/g, ' ');
-        
+        const rawText = (((geminiData.candidates || [])[0] || {}).content || {}).parts?.[0]?.text || '';
+        const cleanQuery = rawText.replace(/[^א-תa-zA-Z0-9\s]/g, '').trim().replace(/\s+/g, ' ');
+
         if (!cleanQuery) {
-            return res.send('id_list_message=t-לא הצלחתי לזהות מילים ברורות בהקלטה&go_to_folder=/');
+            return res.send('id_list_message=t-לא הצלחתי לזהות את הדיבור אנא נסו שנית&go_to_folder=/');
         }
 
+        // שלב 4: חיפוש ב-YouTube API
         const ytUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodeURIComponent(cleanQuery)}&type=video&maxResults=1&key=${YT_KEY}`;
         const ytRes = await fetchWithTimeout(ytUrl);
         const ytData = await ytRes.json();
 
         if (!ytData.items || ytData.items.length === 0) {
-            return res.send('id_list_message=t-לא מצאתי תוצאות לחיפוש זה&go_to_folder=/');
+            return res.send(`id_list_message=t-לא נמצאו תוצאות עבור ${cleanQuery}&go_to_folder=/`);
         }
 
         const videoId = ytData.items[0].id.videoId;
+        const title = (ytData.items[0].snippet.title || '').replace(/[^א-תa-zA-Z0-9\s]/g, ' ');
 
-        // הפניה לנתיב המקומי בשרת (Proxy)
+        // שלב 5: השמעה בימות המשיח באמצעות פקודת id_list_message התקנית לקישור חיצוני
         const hostUrl = `https://${req.get('host')}`;
         const streamUrl = `${hostUrl}/stream/${videoId}.mp3`;
-        
-        return res.send(`read=t-השיעור מתחיל&playfile=${streamUrl}&go_to_folder=/`);
+
+        return res.send(`id_list_message=t-משמיע ${title}.f-${streamUrl}&go_to_folder=/`);
 
     } catch (e) {
-        console.error('Error during processing:', e.message);
+        console.error('Error:', e.message);
         if (!res.headersSent) {
-            res.send('id_list_message=t-אירעה שגיאה במערכת נסו שוב מאוחר יותר&go_to_folder=/');
+            return res.send('id_list_message=t-אירעה תקלה בעיבוד הבקשה&go_to_folder=/');
         }
     }
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`YouTube Line Server running on port ${port}`));
+app.listen(port, () => console.log(`Server listening on port ${port}`));
