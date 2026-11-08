@@ -1,7 +1,12 @@
 const express = require('express');
 const ytDlp = require('yt-dlp-exec');
-const app = express();
+const ffmpeg = require('fluent-ffmpeg');
+const ffmpegPath = require('ffmpeg-static');
 
+// הגדרת נתיב מנוע ההמרה
+ffmpeg.setFfmpegPath(ffmpegPath);
+
+const app = express();
 app.use(express.urlencoded({ extended: true }));
 
 const TOKEN = process.env.YEMOT_TOKEN || '';
@@ -9,7 +14,6 @@ const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
 const YT_KEY = process.env.YOUTUBE_API_KEY || '';
 const YM = 'https://www.call2all.co.il/ym/api/';
 
-// פונקציית עזר לשליחת בקשות API עם מגבלת זמן
 async function fetchWithTimeout(url, options = {}, timeout = 15000) {
     const controller = new AbortController();
     const id = setTimeout(() => controller.abort(), timeout);
@@ -18,7 +22,38 @@ async function fetchWithTimeout(url, options = {}, timeout = 15000) {
     return response;
 }
 
-app.get('/', (req, res) => { res.send('YouTube Line Server OK'); });
+app.get('/', (req, res) => { res.send('YouTube Line Server OK (With MP3 Proxy)'); });
+
+// נתיב חדש להזרמה (Proxy) והמרה ל-MP3
+app.get('/stream', async (req, res) => {
+    const videoId = req.query.v;
+    if (!videoId) return res.status(400).send('Missing video ID');
+
+    try {
+        const info = await ytDlp(`https://www.youtube.com/watch?v=${videoId}`, {
+            dumpJson: true,
+            format: 'bestaudio/best',
+            noWarnings: true,
+            noCheckCertificates: true
+        });
+
+        if (!info || !info.url) throw new Error('No audio URL found');
+
+        res.setHeader('Content-Type', 'audio/mpeg');
+        
+        ffmpeg(info.url)
+            .format('mp3')
+            .audioCodec('libmp3lame')
+            .on('error', (err) => {
+                console.error('FFmpeg stream error:', err.message);
+            })
+            .pipe(res, { end: true });
+
+    } catch (e) {
+        console.error('Streaming error:', e.message);
+        if (!res.headersSent) res.status(500).end();
+    }
+});
 
 app.all(['/yemot', '/yemot/:e'], async (req, res) => {
     const q = { ...req.query, ...req.body };
@@ -27,22 +62,18 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
     try {
         if (q.hangup === 'yes') return res.send('noop=bye');
 
-        // שלב 1: בקשת הקלטה מהמשתמש
         if (!q.RecordPath) {
             const fileName = 'query_' + Date.now();
             return res.send(`read=t-אנא אמרו את שם השיעור לאחר הצפצוף&record=yes&record_filename=${fileName}`);
         }
 
-        // שלב 2: הורדת ההקלטה מימות המשיח
         const downloadUrl = `${YM}DownloadFile?token=${encodeURIComponent(TOKEN)}&path=${encodeURIComponent(q.RecordPath)}`;
         const audioRes = await fetchWithTimeout(downloadUrl);
         if (!audioRes.ok) throw new Error('שגיאה בהורדת הקובץ מימות המשיח');
         const audioBuf = Buffer.from(await audioRes.arrayBuffer());
 
-        // מחיקת ההקלטה מהשרת של ימות המשיח ברקע (חיסכון במקום)
         fetchWithTimeout(`${YM}FileAction?token=${encodeURIComponent(TOKEN)}&action=delete&what=${encodeURIComponent(q.RecordPath)}`).catch(() => null);
 
-        // שלב 3: שליחה ל-Gemini לזיהוי דיבור
         const prompt = "תמלל את ההקלטה לעברית. החזר אך ורק את מילות החיפוש המדויקות ללא מילות קישור, מרכאות או תוספות.";
         const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_KEY}`;
         const geminiRes = await fetchWithTimeout(geminiUrl, {
@@ -67,7 +98,6 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
         
         const cleanQuery = queryText.trim().replace(/\n/g, ' ');
 
-        // שלב 4: חיפוש ב-YouTube API
         const ytUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodeURIComponent(cleanQuery)}&type=video&maxResults=1&key=${YT_KEY}`;
         const ytRes = await fetchWithTimeout(ytUrl);
         const ytData = await ytRes.json();
@@ -78,24 +108,14 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
 
         const videoId = ytData.items[0].id.videoId;
 
-        // שלב 5: חילוץ כתובת השמע הישירה באמצעות yt-dlp
-        const ytDlpOptions = {
-            dumpJson: true,
-            format: 'bestaudio/best',
-            noWarnings: true,
-            noCheckCertificates: true
-        };
-        const info = await ytDlp(`https://www.youtube.com/watch?v=${videoId}`, ytDlpOptions);
+        // הפניה לנתיב המקומי בשרת (Proxy)
+        const hostUrl = `https://${req.get('host')}`;
+        const streamUrl = `${hostUrl}/stream?v=${videoId}`;
         
-        if (!info || !info.url) {
-            return res.send('id_list_message=t-תקלה בחילוץ השמע מהשרת&go_to_folder=/');
-        }
-
-        // שלב 6: הפעלת השמע בימות המשיח
-        return res.send(`read=t-השיעור מתחיל&playfile=${info.url}&go_to_folder=/`);
+        return res.send(`read=t-השיעור מתחיל&playfile=${streamUrl}&go_to_folder=/`);
 
     } catch (e) {
-        console.error('Error during processing:', e);
+        console.error('Error during processing:', e.message);
         if (!res.headersSent) {
             res.send('id_list_message=t-אירעה שגיאה במערכת נסו שוב מאוחר יותר&go_to_folder=/');
         }
